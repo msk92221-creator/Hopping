@@ -46,8 +46,15 @@ OVERLAP_RATIO_MIN = 0.50
 OVERLAP_RATIO_MAX = 0.75
 
 # 한 이미지당 배치할 홉 신호 개수 범위
-MIN_HOPS_PER_IMAGE = 1
-MAX_HOPS_PER_IMAGE = 5
+# ★ 실제 호핑 시나리오: 한 관측 윈도우에 수십 개의 홉이 존재
+MIN_HOPS_PER_IMAGE = 5
+MAX_HOPS_PER_IMAGE = 50
+
+# 개별 홉 신호의 길이 범위 (샘플 수)
+# ★ STFT 윈도우(최대 4096) 대비 충분한 길이 필요 → 최소 1024
+#    짧은 체류(1024 = 0.1ms @10MHz) ~ 긴 체류(16384 = 1.6ms @10MHz)
+HOP_LEN_MIN = 1024
+HOP_LEN_MAX = 16384
 
 # SNR 범위 (dB)
 SNR_MIN_DB = -10.0
@@ -70,10 +77,10 @@ HOPPING_CLASS_ID = 0
 def load_seed_signals(
     seed_dir: str,
     min_power_ratio: float = 0.1,
-    segment_len: int = 1024,
 ) -> List[np.ndarray]:
     """
     실측 IQ 데이터 파일(.npy)에서 신호 구간만 추출하여 리스트로 반환.
+    다양한 길이의 세그먼트를 추출하여 호핑 시뮬레이션의 다양성을 확보.
 
     Parameters
     ----------
@@ -81,21 +88,23 @@ def load_seed_signals(
         .npy 파일들이 위치한 디렉토리 경로.
     min_power_ratio : float
         전체 평균 파워 대비 이 비율 이상인 구간만 '신호'로 간주.
-    segment_len : int
-        추출할 신호 세그먼트의 기본 길이 (샘플 수).
 
     Returns
     -------
     List[np.ndarray]
         추출된 IQ 신호 세그먼트 리스트. 각 원소는 complex64/128 배열.
+        다양한 길이(HOP_LEN_MIN ~ HOP_LEN_MAX)의 세그먼트 포함.
     """
     seed_files = sorted(glob.glob(os.path.join(seed_dir, "*.npy")))
     if not seed_files:
         print(f"[경고] '{seed_dir}' 에서 .npy 파일을 찾지 못했습니다.")
         print("[안내] 내장 합성 신호(Chirp/Burst)를 Seed로 대체합니다.")
-        return _generate_synthetic_seeds(count=20, segment_len=segment_len)
+        return _generate_synthetic_seeds(count=50)
 
     segments: List[np.ndarray] = []
+
+    # 다양한 세그먼트 길이로 추출 (STFT 윈도우 이상의 길이)
+    extract_lengths = [1024, 2048, 4096, 8192, 16384]
 
     for fpath in seed_files:
         # .npy 로드 (complex IQ 데이터 가정)
@@ -106,42 +115,47 @@ def load_seed_signals(
         avg_power = np.mean(power) if np.mean(power) > 0 else 1e-12
         threshold = avg_power * min_power_ratio
 
-        # 신호 구간 탐색: 연속으로 threshold를 넘는 구간 추출
+        # 신호 구간 탐색: 다양한 길이로 추출
         above = power > threshold
-        idx = 0
-        while idx < len(iq_data) - segment_len:
-            if above[idx]:
-                seg = iq_data[idx : idx + segment_len]
-                # 세그먼트 파워 검증
-                if np.mean(np.abs(seg) ** 2) > threshold:
-                    # 정규화: 최대 진폭 기준 0~1 스케일
-                    seg = seg / (np.max(np.abs(seg)) + 1e-12)
-                    segments.append(seg)
-                idx += segment_len  # 다음 구간으로 점프
-            else:
-                idx += 1
+        for segment_len in extract_lengths:
+            idx = 0
+            while idx < len(iq_data) - segment_len:
+                if above[idx]:
+                    seg = iq_data[idx : idx + segment_len]
+                    # 세그먼트 파워 검증
+                    if np.mean(np.abs(seg) ** 2) > threshold:
+                        # 정규화: 최대 진폭 기준 0~1 스케일
+                        seg = seg / (np.max(np.abs(seg)) + 1e-12)
+                        segments.append(seg)
+                    idx += segment_len  # 다음 구간으로 점프
+                else:
+                    idx += 1
 
     if not segments:
         print("[경고] 유효한 신호 구간을 찾지 못했습니다. 합성 신호로 대체합니다.")
-        return _generate_synthetic_seeds(count=20, segment_len=segment_len)
+        return _generate_synthetic_seeds(count=50)
 
     print(f"[로드 완료] 총 {len(segments)}개 신호 세그먼트 추출됨 "
-          f"(파일 {len(seed_files)}개)")
+          f"(파일 {len(seed_files)}개, "
+          f"길이 범위: {min(len(s) for s in segments)}~{max(len(s) for s in segments)} 샘플)")
     return segments
 
 
 def _generate_synthetic_seeds(
-    count: int = 20,
-    segment_len: int = 1024,
+    count: int = 50,
 ) -> List[np.ndarray]:
     """
     실측 데이터가 없을 때 사용할 합성 Seed 신호 생성.
-    Chirp, 단일 톤(CW), BPSK Burst 등 다양한 파형 포함.
+    Chirp, 단일 톤(CW), BPSK Burst 등 다양한 파형을
+    다양한 길이(HOP_LEN_MIN ~ HOP_LEN_MAX)로 생성.
     """
     seeds: List[np.ndarray] = []
-    t = np.arange(segment_len, dtype=np.float64)
 
     for i in range(count):
+        # ★ 매 Seed마다 랜덤한 길이 (짧은 홉 ~ 긴 홉)
+        segment_len = random.randint(HOP_LEN_MIN, HOP_LEN_MAX)
+        t = np.arange(segment_len, dtype=np.float64)
+
         waveform_type = random.choice(["chirp", "cw", "bpsk"])
 
         if waveform_type == "chirp":
@@ -159,7 +173,7 @@ def _generate_synthetic_seeds(
         else:
             # BPSK Burst
             symbol_len = random.choice([4, 8, 16, 32])
-            n_symbols = segment_len // symbol_len
+            n_symbols = max(segment_len // symbol_len, 1)
             bits = np.random.choice([-1, 1], size=n_symbols)
             baseband = np.repeat(bits, symbol_len)[:segment_len].astype(np.complex128)
             carrier_freq = random.uniform(0.05, 0.3)
@@ -169,7 +183,9 @@ def _generate_synthetic_seeds(
         sig = sig / (np.max(np.abs(sig)) + 1e-12)
         seeds.append(sig)
 
-    print(f"[합성 Seed] {count}개 합성 신호 생성 완료 (chirp/cw/bpsk)")
+    lens = [len(s) for s in seeds]
+    print(f"[합성 Seed] {count}개 합성 신호 생성 완료 "
+          f"(chirp/cw/bpsk, 길이: {min(lens)}~{max(lens)} 샘플)")
     return seeds
 
 
@@ -322,6 +338,7 @@ def place_hops_in_frame(
     frame_len: int,
     fs: float,
     n_hops: int,
+    nfft: int = 1024,
 ) -> Tuple[np.ndarray, List[Dict]]:
     """
     배경 노이즈 프레임에 여러 개의 호핑 신호를 랜덤 배치.
@@ -336,6 +353,8 @@ def place_hops_in_frame(
         샘플링 레이트 (Hz).
     n_hops : int
         배치할 홉 개수.
+    nfft : int
+        현재 STFT 윈도우 크기. 홉 길이의 하한을 결정하는 데 사용.
 
     Returns
     -------
@@ -349,15 +368,26 @@ def place_hops_in_frame(
     frame = np.zeros(frame_len, dtype=np.complex128)
     hop_info_list: List[Dict] = []
 
+    # ★ 최소 홉 길이: NFFT의 2배 이상이어야 STFT에서 최소 2~3 타임빈에 걸침
+    #    이래야 스펙트로그램에서 눈에 보이고 bbox도 유효한 크기가 됨
+    effective_hop_min = max(HOP_LEN_MIN, nfft * 2)
+    effective_hop_max = min(HOP_LEN_MAX, frame_len // 2)
+    if effective_hop_min > effective_hop_max:
+        effective_hop_min = effective_hop_max
+
     for _ in range(n_hops):
         # 랜덤 Seed 선택
         seed = random.choice(seeds).copy()
-        seg_len = len(seed)
 
-        # 신호가 프레임보다 길면 잘라냄
-        if seg_len > frame_len:
-            seed = seed[:frame_len]
-            seg_len = frame_len
+        # ★ 홉 길이 결정: NFFT 연동 최소 길이 보장
+        desired_len = random.randint(effective_hop_min, effective_hop_max)
+
+        # Seed가 desired_len보다 짧으면 반복(tile)으로 늘림
+        if len(seed) < desired_len:
+            reps = int(np.ceil(desired_len / len(seed)))
+            seed = np.tile(seed, reps)
+        seed = seed[:desired_len]
+        seg_len = len(seed)
 
         # ── 채널 손상 적용 ──
         seed = augment_signal(seed, fs)
@@ -664,17 +694,7 @@ def generate_one_sample(
     """
     frame_len = int(fs * frame_duration_sec)
 
-    # ── (a) 홉 개수 랜덤 결정 ──
-    n_hops = random.randint(MIN_HOPS_PER_IMAGE, MAX_HOPS_PER_IMAGE)
-
-    # ── (b) 호핑 신호 배치 ──
-    frame, hop_infos = place_hops_in_frame(seeds, frame_len, fs, n_hops)
-
-    # ── (c) 전체 프레임에 AWGN 적용 ──
-    snr_db = random.uniform(SNR_MIN_DB, SNR_MAX_DB)
-    frame = apply_awgn(frame, snr_db)
-
-    # ── (d) 가변 NFFT 선택 ──
+    # ── (a) 가변 NFFT를 먼저 선택 (홉 길이 결정에 필요) ──
     nfft = random.choice(NFFT_CANDIDATES)
 
     # Overlap: NFFT의 50%~75% 사이 랜덤
@@ -685,6 +705,17 @@ def generate_one_sample(
     if nfft > frame_len:
         nfft = min(NFFT_CANDIDATES[0], frame_len)
         overlap = int(nfft * overlap_ratio)
+
+    # ── (b) 홉 개수 랜덤 결정 ──
+    n_hops = random.randint(MIN_HOPS_PER_IMAGE, MAX_HOPS_PER_IMAGE)
+
+    # ── (c) 호핑 신호 배치 ──
+    # ★ NFFT를 전달하여 홉 길이가 STFT 해상도에 맞도록 보장
+    frame, hop_infos = place_hops_in_frame(seeds, frame_len, fs, n_hops, nfft)
+
+    # ── (d) 전체 프레임에 AWGN 적용 ──
+    snr_db = random.uniform(SNR_MIN_DB, SNR_MAX_DB)
+    frame = apply_awgn(frame, snr_db)
 
     # ── (e) STFT 계산 ──
     freqs, times, Sxx_db = compute_stft(frame, fs, nfft, overlap)
@@ -998,8 +1029,8 @@ def parse_args() -> argparse.Namespace:
         help="샘플링 레이트 Hz (기본: 10 MHz)",
     )
     parser.add_argument(
-        "--frame_duration", type=float, default=0.01,
-        help="프레임 지속 시간 초 (기본: 0.01 = 10ms)",
+        "--frame_duration", type=float, default=0.05,
+        help="프레임 지속 시간 초 (기본: 0.05 = 50ms, 많은 홉 수용)",
     )
     parser.add_argument(
         "--train_ratio", type=float, default=0.8,
